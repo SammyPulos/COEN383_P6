@@ -3,112 +3,146 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include <string.h>
+#include <unistd.h>
+#include <signal.h>
 
 #define NUM_CHILDREN 5
 #define READ_END     0
 #define WRITE_END    1
-
-// TODO
-// have children repeatedly send msgs after a random delay
-// have the active child take input from stdin to send over pipe
-// select to repeatedly take in messages from children
-// write recieved messages to output file (with second timestamp?)
-// figure out if this is everything we need to do
+#define MESSAGE_SIZE 256
 
 void execChild(int id, int * fd);
 void execActiveChild(int id, int * fd);
 void generateTimestamp(char * timestamp);
+void writeTofile(char *msg);
 
 int main() {
+    int fds[5][2];
+    pid_t c_pid[5];
+    pid_t p_pid = getpid();
+    int i = 0;
+    srand(0);
 
-    pid_t pid;
-    int fd[5][2];
-
-    // Create pipes
-    int i;
-    for (i = 0; i < NUM_CHILDREN; ++i) {
-        if (pipe(fd[i]) == -1) {
-            fprintf(stderr, "pipe() failed for %d\n", i);
+    // Create Pipes
+    for(i = 0; i < NUM_CHILDREN; ++i) {
+        if (pipe(fds[i]) == -1) {
+            fprintf(stderr, "pipe() failed\n");
             return -1;
         }
     }
 
+    // Fork processes
     for (i = 0; i < NUM_CHILDREN; ++i) {
-        pid = fork();
+        pid_t fork_result = fork();
 
-        if (pid == 0) {
+        if (fork_result == 0) {
+            // Child code
+            printf("Child %d with pid %d created\n",i,getpid());
             if (i < NUM_CHILDREN - 1) {
-                execChild(i, fd[i]);
-                return i;
-            }
+                execChild(i, fds[i]);
+                return 0;
+            } 
             else {
-                execActiveChild(i, fd[i]);
-                return i;
+                execActiveChild(i, fds[i]);
+                return 0;
             }
-        }
-
-        else if (pid < 0) {
+        } 
+        else if (fork_result > 0) { 
+            c_pid[i] = fork_result;
+            close(fds[i][WRITE_END]);
+        } 
+        else {
             fprintf(stderr, "fork() failed on child %d\n", i);
-            return pid;
+            return -1;
         }
     }
-
 
     // Parent code
+    close(0);
+    time_t start_time = time(0);
 
-    for (i = 0; i < NUM_CHILDREN; ++i)
-        close(fd[i][WRITE_END]);
+    fd_set inputfds;
+    struct timeval timeout;
+    char read_buffer[MESSAGE_SIZE];
+    int select_result = 1;
 
-    char messageBuffer[32];
-    int bytesRead = 0;
-    while (bytesRead <= 0) {
-        bytesRead = read(fd[0][READ_END], messageBuffer, 32);
-        printf("%d bytes read\n", bytesRead);
+    while (select_result > 0) {
+        if(time(0) > start_time + 30) {
+            for(i = 0; i < NUM_CHILDREN; ++i) {
+                kill(c_pid[i], SIGKILL);
+            }
+            return 0;
+        }
+
+        FD_ZERO(&inputfds);
+        for(i = 0; i < NUM_CHILDREN; ++i) {
+            FD_SET(fds[i][READ_END], &inputfds);
+        }
+
+        timeout.tv_sec = 2;
+        timeout.tv_usec = 500000;
+
+        select_result = select(FD_SETSIZE, &inputfds, 0, 0, &timeout);
+
+        if (select_result < 0) {
+            printf("Select Error\n");
+        } else if (select_result > 0) {
+            for(i = 0; i < NUM_CHILDREN; ++i) {
+                if(FD_ISSET(fds[i][READ_END], &inputfds)) {
+                    int nread = read(fds[i][READ_END], read_buffer, MESSAGE_SIZE);
+                    read_buffer[nread] = 0;
+                    writeTofile(read_buffer);
+                }
+            }
+        }
     }
-    printf("Child 1 said: %s", messageBuffer);
 
-    for (i = 0; i < NUM_CHILDREN; ++i)
-        close(fd[i][READ_END]);
+    for (i = 0; i < NUM_CHILDREN; ++i) {
+        close(fds[i][READ_END]);
+    }
 
-    printf("Parent completed\n");
     return 0;
 }
 
+void execChild(int id, int * pipe) {
+    close(0);
+    close(pipe[READ_END]);
+    char timestamp[16] = {0};
+    char msg_buffer[MESSAGE_SIZE] = {0};
+    int msg_count = 1;
 
-void execChild(int id, int * fd) {
-    printf("Child %d created\n", id);
-    close(fd[READ_END]);
+    while(1) {
+        generateTimestamp(timestamp);
+        sprintf(msg_buffer, "%s : Child %d message %d \n", timestamp, id, msg_count);
+        write(pipe[WRITE_END], msg_buffer, strlen(msg_buffer) + 1);
+        ++msg_count;
 
-    int msgCount = 1;    
-    char message[32];
-    char timestamp[16];
-
-    generateTimestamp(timestamp);
-    sprintf(message, "%s: Child %d message %d\n", timestamp, id, msgCount);
-    write(fd[WRITE_END], message, strlen(message) + 1);
-    printf("Child %d sending parent: %s", id, message);
-
-    close(fd[WRITE_END]);
+        int sleep_time = rand() % 3;
+        sleep(sleep_time);
+    }
 }
 
-void execActiveChild(int id, int * fd) {
-    printf("Active child %d created\n", id);
-    close(fd[READ_END]);
+void execActiveChild(int id, int * pipe) {
+    char timestamp[16] = {0};
+    char input[MESSAGE_SIZE - 60] = {0};
+    char msg_buffer[MESSAGE_SIZE] = {0};
+    char msg_count = 1;
 
-    int msgCount = 1;
-    char message[32] = "TODO: get user input\n";
-    char timestamp[16];
+    while(1) {
+        fgets(input, sizeof(msg_buffer), stdin);
+        generateTimestamp(timestamp);
 
-    generateTimestamp(timestamp);
-    // TODO: need to get user input to send to parent
-    write(fd[WRITE_END], message, strlen(message) + 1);
-    printf("Child %d sending parent: %s", id, message);
+        sprintf(msg_buffer, "%s : Child %d message %d: %s", timestamp, id, msg_count, input);
+        write(pipe[WRITE_END], msg_buffer, strlen(msg_buffer) + 1);
+        ++msg_count;
 
-    close(fd[WRITE_END]);
+        int sleep_time = rand() % 3;
+        sleep(sleep_time);
+    }
 }
 
-void generateTimestamp(char * timestamp) {  
-    // TODO: validate this timestamp, is it accurate and in proper form
+void generateTimestamp(char * timestamp)
+{
     struct timeval tv;
     gettimeofday(&tv, NULL);
 
@@ -116,5 +150,20 @@ void generateTimestamp(char * timestamp) {
     int msec = (int) tv.tv_usec / 1000;
 
     sprintf(timestamp, "0:%02d.%03d", sec, msec);
+}
+
+void writeTofile(char *msg) {
+    FILE * out_fd = NULL;
+    out_fd = fopen("output.txt", "a+");
+    if(out_fd == NULL) {
+        printf("Error opening output.txt\n");
+        return;
+    }
+
+    char timestamp[16] = {0};
+    generateTimestamp(timestamp);
+    fprintf(out_fd, "%s : %s\n", timestamp, msg);
+
+    fclose(out_fd);
 }
 
